@@ -1,0 +1,1358 @@
+---
+title: "HW5: Bikeshare"
+author: "Rebekah Adams and Jack Rummler"
+date: "2022-12-16"
+output: 
+  html_document:
+    toc: True
+    toc_float: True
+    code_folding: hide
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# **Forecasting NJ Transit Train Delays:** 
+# **_The Flex Commuter_**
+
+With the recent shift to hybrid work, commuters now have more flexibility when they choose to ride. With greater options comes less patience for delays. Our app [**The Flex Commuter**](https://www.youtube.com/watch?v=vrF7Rini-4M) takes the guesswork out of planning a commute and uses a sophisticated machine-learning model to predict train delays in advance, helping commuters maximize their time.
+
+The Northeast Corridor (NEC) is a rail commuter line that connects Trenton, New Jersey to New York’s Penn Station. 78% of all NJ Transit riders use the line and the average delay in FY 2015 was 17 minutes. We decided to focus on this line as a pilot given the popularity of the route and the definitive gap in operational efficiency, but we hope to expand our app to other NJ Transit train lines in the future.
+
+Here, we provide the code we used to create the models for this app. Follow along to predict delays for a train near you.
+
+```{r wireframe, out.width='100%'}
+knitr::include_graphics("presentation/app_screen2.png")
+```
+
+```{r set up, eval = TRUE, include = FALSE, message=FALSE, warning = FALSE}
+library(tidyverse)
+library(sf)
+library(lubridate)
+library(tigris)
+library(tidycensus)
+library(viridis)
+library(riem)
+library(gridExtra)
+library(grid)
+library(knitr)
+library(kableExtra)
+library(RSocrata)
+library(gganimate)
+library(gifski)
+library(caret)
+library(knitr) 
+library(pscl)
+library(sfheaders)
+library(gganimate)
+library(gifski)
+library(plotROC)
+library(pROC)
+#install.packages("ggrepel")
+library(ggrepel)
+
+palette_plasma_na = c("#0d0887", "#7e03a8", "#cc4778", "#f89540", "#f0f921", "#ffffff") #white at the end
+
+# Req of using NJ Transit data: credit line must be "Data provided by NJ TRANSIT, which is the sole owner of the Data"
+```
+
+## Data cleaning
+
+We used Pranav Badami’s dataset of NJ Transit and Amtrak (NEC) Rail Performance ([available on Kaggle](https://www.kaggle.com/datasets/pranavbadami/nj-transit-amtrak-nec-performance?select=2018_11.csv)) as our primary dataset of train departures, arrivals, and delays. We chose to use the datasets from November and December of 2019 filtered this dataset down to just NJ Transit trains on the Northeast Corridor (NEC) for our analysis.
+
+```{r data cleaning from GTFS pt 1, eval = FALSE, include = FALSE, message=FALSE, warning = FALSE}
+
+# Read in and convert GTFS stops data into an sf object. Save as geojson
+# Leave commented out unless updating GTFS data
+# stops <- read.table("data/Nj_Transit_Rail_GTFS/stops.txt", header = T, sep=",", fileEncoding = "latin1") %>%
+#   mutate(station_lat = stop_lat) %>% # extract the stop latitudes for train direction later
+#   st_as_sf(coords = c(x = "stop_lon", y = "stop_lat"), crs = 4326) %>%
+#   st_write("data/NJ_Transit_Stops_wLat.geojson", append = FALSE)
+```
+
+To georeference the stations and rail network, we used NJ Transit’s GTFS feed. This GTFS data is provided by NJ TRANSIT, which is the sole owner of the Data.  After reading our station stops, we then create a new column of station names to match the Kaggle data set's station names, so we can join them later.
+
+```{r data cleaning from GTFS pt 2, eval = TRUE, results = FALSE, message=FALSE, warning = FALSE}
+
+stops <- st_read("data/NJ_Transit_Stops_wLat.geojson") %>% #read in the stops geojson
+  st_transform("EPSG:4326") %>%
+  mutate(common_name = case_when( # Clean the station names so they match kaggle data
+    stop_name == "ATLANTIC CITY" ~ "ATLANTIC CITY RAIL TERMINAL",
+    stop_name == "BROADWAY" ~ "BROADWAY FAIR LAWN",
+    stop_name == "CONVENT" ~ "CONVENT STATION",
+    stop_name == "EDISON STATION" ~ "EDISON",
+    stop_name == "EGG HARBOR" ~ "EGG HARBOR CITY",
+    stop_name == "JERSEY AVE." ~ "JERSEY AVENUE",
+    stop_name == "MSU" ~ "MONTCLAIR STATE U",
+    stop_name == "NEWARK AIRPORT RAILROAD STATION" ~ "NEWARK AIRPORT",
+    stop_name == "NEWARK BROAD ST" ~ "NEWARK BROAD STREET",
+    stop_name == "PENNSAUKEN TRANSIT CENTER" ~ "PENNSAUKEN",
+    stop_name == "30TH ST. PHL." ~ "PHILADELPHIA",
+    stop_name == "POINT PLEASANT" ~ "POINT PLEASANT BEACH",
+    stop_name == "PRINCETON JCT." ~ "PRINCETON JUNCTION",
+    stop_name == "RADBURN" ~ "RADBURN FAIR LAWN",
+    stop_name == "RAMSEY"~ "RAMSEY MAIN ST",
+    stop_name == "RAMSEY ROUTE 17 STATION" ~ "RAMSEY ROUTE 17",
+    stop_name == "FRANK R LAUTENBERG SECAUCUS LOWER LEVEL" ~ "SECAUCUS LOWER LVL",
+    stop_name == "FRANK R LAUTENBERG SECAUCUS UPPER LEVEL" ~ "SECAUCUS UPPER LVL",
+    stop_name == "TRENTON TRANSIT CENTER" ~ "TRENTON",
+    stop_name == "WAYNE/ROUTE 23 TRANSIT CENTER [RR]" ~ "WAYNE-ROUTE 23",
+    stop_name == "WOOD-RIDGE" ~ "WOOD RIDGE",
+    TRUE ~ stop_name))
+```
+
+We read in the boundaries of NJ and NYC from their associated governments' APIs.
+
+```{r boundaries, eval = TRUE, message=FALSE, warning = FALSE, results=FALSE}
+nj_shape <- st_read("https://maps.nj.gov/arcgis/rest/services/Framework/Government_Boundaries/MapServer/0/query?outFields=*&where=1%3D1&f=geojson") %>%
+  st_transform("epsg: 4326")
+
+nyc <- st_read("https://data.cityofnewyork.us/resource/7t3b-ywvw.geojson") %>%
+  st_transform("EPSG:4326")
+  
+```
+
+```{r r5r set up, eval = FALSE, include = FALSE, message=FALSE, warning = FALSE}
+# IGNORE
+# Set up for R5R core - leave commented out unless re-running R5R for line creation.
+# First - for the r5r core:
+# options(java.parameters = "-Xmx2G")
+# options(java.parameters = c("-XX:+UseConcMarkSweepGC", "-Xmx8192m"))
+# gc()
+# 
+# library(r5r)
+#  # Set up r5r core
+# r5r_core <- setup_r5(data_path = "data//r5r",
+#           verbose = TRUE)
+```
+
+```{r NJ transit line shapes, include = FALSE, eval = FALSE, message=FALSE, warning = FALSE}
+# transit_lines <- transit_network_to_sf(r5r_core)
+# 
+# transit_routes <- transit_lines$routes
+# 
+# nec_line <- transit_routes %>%
+#   filter(long_name == "Northeast Corridor") %>%
+#   st_as_sf()%>%
+#   st_transform("EPSG:4326") %>%
+#   st_write("data/nec_line.geojson")
+
+```
+
+```{r read in nec line shapes, include = FALSE, eval = TRUE, message=FALSE, results=FALSE, warning = FALSE}
+nec_line <- st_read("data/nec_line.geojson")%>%
+  st_transform("EPSG:4326")
+
+```
+
+Next, we called on the REIM API to source weather data (precipitation, temperature, and wind speeds) from Newark Airport in November and December 2019.
+
+```{r weather, eval = TRUE, message=FALSE, results=FALSE, warning = FALSE, fig.align="center", fig.height=15, fig.width=10}
+# Weather at Newark airport, Nov-Dec 2019
+weather.Panel <- 
+  riem_measures(station = "EWR", date_start = "2019-11-01", date_end = "2019-12-31") %>%
+  dplyr::select(valid, tmpf, p01i, sknt)%>%
+  replace(is.na(.), 0) %>%
+    mutate(interval60 = ymd_h(substr(valid,1,13))) %>%
+    mutate(week = week(interval60),
+           dotw = wday(interval60, label=TRUE)) %>%
+    group_by(interval60) %>%
+    summarize(Temperature = max(tmpf),
+              Precipitation = sum(p01i),
+              Wind_Speed = max(sknt)) %>%
+    mutate(Temperature = ifelse(Temperature == 0, 42, Temperature))
+
+glimpse(weather.Panel)
+```
+
+```{r save weather, include = FALSE, eval = FALSE, message=FALSE, warning = FALSE}
+#ggsave("weather_panel.png", plot=weather_panel, path="C:/Users/jtrum/MUSA_508_Final/508Final_Adams_Rummler/presentation/")
+```
+
+Next, we read in the Kaggle datasets, and then joined these data to the GTFS' station stops. Finally, we extract the NEC's stations into a separate dataset for later mapping.
+
+```{r data cleaning from Kaggle, eval = TRUE, message=FALSE, warning = FALSE}
+
+# Read in Kaggle datasets
+nov19 <- read_csv("data//2019_11.csv") %>%
+  filter(type == "NJ Transit")
+
+dec19 <- read_csv("data//2019_12.csv") %>%
+  filter(type == "NJ Transit")
+
+# Combine Kaggle data sets
+nj_transit <- rbind(nov19, dec19)
+
+# Clean Kaggle dataset, join to GTFS station points
+nj_transit_cleaned <- nj_transit %>%
+  mutate(common_name = toupper(to)) %>%
+  left_join(., stops, by = "common_name") %>%
+  as.data.frame(.) %>%
+  st_as_sf() %>%
+  st_transform("EPSG:4326") %>%
+  filter(common_name != "SECAUCUS CONCOURSE") %>%
+  dplyr::select(-stop_desc, -stop_name, -type)
+
+# Extract just the NEC stations for later mapping
+nec_stations <- nj_transit_cleaned %>%
+  filter(line == "Northeast Corrdr") %>%
+  dplyr::select(to) %>%
+  group_by(to) %>%
+  summarize() %>%
+  rename(station = to)
+  
+```
+
+We now need to create a dataset for just the Northeast Corridor line (NEC). To do so, we:
+
+* **Filter train line:** First, we filtered out other NJ Transit lines, so that our dataset is just the Northeast Corridor line (NEC).
+
+* **Address outlier:** Next, we filtered out an instance of a train delayed by 500 minutes (9 hours). Given that this is such an extreme outlier in our data, and given the context, we removed this since it appears to be a data entry or scraping error. Likely the train was not actually 9 hours late, but rather was rescheduled or cancelled and ran later in the day.
+
+* **Time:** We created new columns to identify the hour, week, and day of the week in which the train was scheduled to depart.
+
+* **Weather:** we joined the previous weather data to our NEC data set based on the time of day.
+
+* **Remove Duplicate rows:** We removed duplicate rows by creating an index of duplicated rows based on key identifiers, and then filtering these out.
+
+* **Direction of Travel:** We created a variable to recognize train's direction of travel, based on the latitude of sequenced stations. 
+
+```{r nec set up pt 1, cache=TRUE, message = FALSE, warning = FALSE}
+
+holiday_days = c(332, 359) #Thanksgiving, Christmas
+
+# Set up df for NE Corridor Line
+ne_corridor <- nj_transit_cleaned %>%
+  filter(line == "Northeast Corrdr") %>%
+  na.omit() %>% 
+  filter(delay_minutes < 200) %>% #remove outlier 9-hour delay (probably a data scraping/entry error)
+  mutate(interval60 = floor_date(ymd_hms(scheduled_time), unit = "hour"),
+         #interval15 = floor_date(ymd_hms(actual_time), unit = "15 mins"),
+         hour = hour(scheduled_time),
+         week = week(scheduled_time),
+         dotw = wday(scheduled_time, label=TRUE),
+         station = to) %>%
+  dplyr::select(station, to, from, train_id, scheduled_time, stop_sequence, delay_minutes, status, hour, week, dotw, interval60, station_lat) %>%
+  left_join(., weather.Panel, by = "interval60") %>% # Join with weather data
+  arrange(train_id, scheduled_time, stop_sequence) # Arrange by train, time, and sequence
+
+# Create index of duplicated rows
+dupeindex <- duplicated(st_drop_geometry(ne_corridor %>% 
+                                           select(station, to, from, 
+                                                  train_id, scheduled_time)))
+
+# Remove the duplicated rows
+ne_corridor <- ne_corridor[!dupeindex,] %>%
+  mutate(
+    # Make Penn Station "north" of Secaucus
+    adj_station_lat = case_when(
+      station == "New York Penn Station" ~ 40.8,
+      station != "New York Penn Station" ~ station_lat),
+    # Direction of travel
+    direction = case_when(
+      stop_sequence != 1 &
+        train_id == dplyr::lag(train_id,1) &
+        stop_sequence > dplyr::lag(stop_sequence) &
+        adj_station_lat > dplyr::lag(adj_station_lat) ~ "NORTHBOUND",
+      stop_sequence != 1 &
+        train_id == dplyr::lag(train_id,1) &
+        stop_sequence > dplyr::lag(stop_sequence) &
+        adj_station_lat < dplyr::lag(adj_station_lat) ~ "SOUTHBOUND",
+      stop_sequence == 1 &
+        train_id == dplyr::lead(train_id,1) &
+        stop_sequence < dplyr::lead(stop_sequence) &
+        adj_station_lat < dplyr::lead(adj_station_lat) ~ "NORTHBOUND",
+      stop_sequence == 1 &
+        train_id == dplyr::lead(train_id,1) &
+        stop_sequence < dplyr::lead(stop_sequence) &
+        adj_station_lat > dplyr::lead(adj_station_lat) ~ "SOUTHBOUND"))
+
+```
+
+## Exploratory Analysis
+Exploring the data helped us understand the spatial and temporal process at work in train delays, which ultimately helped us build an effective model. Although this section is presented before feature engineering, our exploratory analysis developed in tandem with feature engineering. The results of our exploratory analysis informed our engineering, and our engineering helped us explore the dataset, and engineer even more new features for further exploration.
+
+### Weather
+What was the weather like in Newark in November and December 2019? We've plotted the changes in the weather below.
+
+```{r plot_weather, cache = TRUE, warning=FALSE, message=FALSE, results=FALSE}
+# Weather plot
+weather_panel <- grid.arrange(
+  ggplot(weather.Panel, aes(interval60,Precipitation, color = Precipitation)) + geom_line() + scale_color_gradient(low = "#d0d1e6", high = "#0570b0")+
+  labs(title="Precipitation", x="Hour", y="inches") + theme_bw(),
+  
+  ggplot(weather.Panel, aes(interval60,Wind_Speed, color = Wind_Speed)) + geom_line() + 
+    scale_color_gradient(low = "#9ebcda", high = "#4d004b")+
+    labs(title="Wind Speed", x="Hour", y="mph", color="Wind Speed") + theme_bw(),
+  
+  ggplot(weather.Panel, aes(interval60,Temperature, color = Temperature)) + geom_line() + 
+    scale_color_gradient(low = "#74add1", high = "#f46d43")+
+    labs(title="Temperature", x="Hour", y="Temperature (°F)") + theme_bw(),
+  
+  top="Weather Data - Newark, NJ (Nov. & Dec. 2019)")
+```
+
+### Delays over time
+The chart below shows the delays of NEC trains over the course of November and December 2019. In purple, the average delay for the time period is noted, at nearly 4 minutes per train. The FY15 and FY16 average delays are also indicated, in yellow and pink, respectively.
+
+```{r delay over time,  message = FALSE, warning = FALSE}
+tg   <- as.POSIXct("2019-11-22 12:00:00 UTC")
+xmas <- as.POSIXct("2019-12-25 12:00:00 UTC")
+
+del_over_time <- ggplot(ne_corridor)+ 
+  geom_line(aes(x = scheduled_time, y = delay_minutes))+
+  #geom_hline(aes(yintercept = 16.6), linetype = "dashed", color = "#cc4778", size = 1)+
+  #geom_hline(aes(yintercept = 17), linetype = "dashed", color = "#f0f921", size = 1)+
+  #geom_hline(aes(yintercept = mean(delay_minutes)), linetype = "dashed", color = "#7e03a8", size = 1)+
+  geom_vline(xintercept = tg, linetype = 4, size=1, color="#cc4778") +
+  geom_vline(xintercept = xmas, linetype = 4, size=1, color="#cc4778") +
+  labs(title="Delays in minutes - NE Corridor",
+       subtitle = "NJ Transit (Nov. and Dec. 2019)",
+       x="Date", 
+       y="Delay in Minutes",
+       caption=#"Yellow line indicates FY15 average delays
+       #Pink line indicates FY16 average delays
+       "Pink vertical lines indicate Thanksgiving and Christmas")+
+  theme_bw()
+
+del_over_time
+
+```
+
+```{r save del_over_time, include = FALSE, eval = FALSE}
+#ggsave("delovertime.png", plot=del_over_time, path="C:/Users/jtrum/MUSA_508_Final/508Final_Adams_Rummler/presentation/")
+```
+
+### Delays by station
+In this chart, we show the average delay for each NEC station over the course of our study period. On average, delays are longest at Secaucus, followed by Jersey Avenue. Trenton commuters can count themselves lucky - they have the shortest delay, on average. This chart is ordered from north to south to see the sequential order of average delays.
+
+```{r delays by station, cache=TRUE, message = FALSE, warning = FALSE, fig.align="center", fig.height=7, fig.width=10}
+station_delay <- ggplot(ne_corridor %>% filter(delay_minutes < 200) %>%
+         group_by(station) %>%
+         summarize(avg_delay = mean(delay_minutes)))+
+  geom_bar(aes(y = factor(station, levels =  # Sort stations south to north
+                            c("Trenton",
+                              "Hamilton",
+                              "Princeton Junction",
+                              "Jersey Avenue",
+                              "New Brunswick",
+                              "Edison",
+                              "Metuchen",
+                              "Metropark",
+                              "Rahway",
+                              "Linden",
+                              "Elizabeth",
+                              "North Elizabeth",
+                              "Newark Airport",
+                              "Newark Penn Station",
+                              "Secaucus Upper Lvl",
+                              "New York Penn Station"
+                            )), x = avg_delay, fill = avg_delay), stat = "identity")+ #fill="#cc4778")+
+  
+  scale_fill_viridis(option = "plasma", guide="legend")+
+  labs(title="Average Delay per station - NE Corridor",
+       subtitle = "NJ Transit (Nov. and Dec. 2019)",
+       x="Station", 
+       y="Average Delay (minutes)",
+       fill = "Average Delay\n(minutes)")+
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=0.4))
+
+station_delay
+```
+
+```{r save station_delay, include = FALSE, eval = FALSE}
+#ggsave("stationdelay.png", plot=station_delay, path="C:/Users/jtrum/MUSA_508_Final/508Final_Adams_Rummler/presentation/")
+```
+
+
+```{r map of average delays by station, include = FALSE, eval= FALSE, message = FALSE, warning = FALSE, fig.align="center"}
+
+# Here, the average delays are mapped by station along the NEC line. As we saw in the previous chart, Secaucaus sees the highest average delays, and Trenton, the fewest.
+
+del_by_station <- ggplot(data = ne_corridor %>%
+         group_by(station) %>%
+         summarize(avg_delay = mean(delay_minutes)))+
+  geom_sf(data = nj_shape, fill = "gray", color = "gray40")+
+  geom_sf(data = nyc, fill = "gray", color = "gray40")+
+  geom_sf(data = nec_line, color = "white")+
+  geom_sf(aes(size = avg_delay, color = avg_delay))+
+  scale_color_viridis(option = "plasma", guide="legend")+
+  scale_size_continuous(range = c(2.5, 5))+
+  #scale_color_continuous(limits=c(2.5, 5), breaks=seq(2.5, 5, by=0.5)) +
+  #scale_size_continuous(limits=c(2.5, 5), breaks=seq(2.5,5, by=0.5))+
+  labs(title = "Average delay in minutes, by station - NE Corridor",
+       subtitle = "NJ Transit, November & December 2019",
+       color = "Average Delay 
+(minutes)",
+       size = "Average Delay 
+(minutes)")+
+  ylim(40.21, 40.8)+
+  xlim(-74.8, -73.99)+
+  theme_void()
+
+del_by_station
+```
+
+```{r save station delay map, eval = FALSE, include=FALSE}
+#ggsave("stationdelay_map.png", plot=del_by_station, path="C:/Users/jtrum/MUSA_508_Final/508Final_Adams_Rummler/presentation/")
+```
+
+
+```{r delays over time, eval = FALSE, include = FALSE, message = FALSE, warning = FALSE, fig.align="center"}
+
+### Trips by Time
+# The chart below shows the number of train trips in progress over the course of the day, for the different days of the week. There is a clear peak of train service for the weekdays between about 6 and 9 am; and a smaller, later peak between 3 and 7 pm. Weekends have fewer train trips, with a small peak in the evening hours.
+
+
+dotw <- ggplot(ne_corridor %>% mutate(hour = hour(scheduled_time)))+
+     geom_freqpoly(aes(x= hour, color = dotw), binwidth = 1,)+
+  scale_color_viridis(option = "plasma", discrete = TRUE)+
+  xlim(0, 24)+
+  labs(title="Train trips in progress, by day of the week", 
+       subtitle="NE Corridor Line (Nov. & Dec. 2019)",
+       x="Hour", 
+       y="Trip Counts",
+       color = "Day of\nthe week")+
+     theme_bw()
+
+dotw
+```
+
+```{r save dotw, eval = FALSE, include=FALSE}
+# ggsave("dotw.png", plot=dotw, path="C:/Users/jtrum/MUSA_508_Final/508Final_Adams_Rummler/presentation/")
+```
+
+### Delays by station over time
+
+```{r gif, eval = FALSE, include=FALSE, message = FALSE, warning = FALSE}
+nov18 <- filter(ne_corridor, yday(interval60) == 322) %>% #Nov 18
+  mutate(interval15 = floor_date(ymd_hms(scheduled_time), unit = "15 mins")) %>%
+  dplyr::select(station, scheduled_time, delay_minutes, interval15, direction)
+
+nov18.panel <- expand.grid(interval15 = unique(nov18$interval15),
+                            station = unique(nov18$station))
+
+nj_animation_data <- 
+  left_join(nov18.panel, nov18, by = c("interval15", "station")) %>%
+  group_by(interval15, station) %>%
+  summarize(MedDelay = median(delay_minutes, na.rm = T)) %>%
+  ungroup() %>%
+  left_join(nec_stations, by=c("station")) %>%
+  st_sf() %>%
+    mutate(Delay = case_when(MedDelay == 0 ~ "0 minutes",
+                             MedDelay > 0 & MedDelay <= 5 ~ "Under 5 minutes",
+                             MedDelay > 5 & MedDelay <= 10 ~ "5-10 minutes",
+                             MedDelay > 10 & MedDelay <= 20 ~ "10-20 minutes",
+                             MedDelay > 20 ~ "20+ minutes",
+                             is.na(MedDelay) ~ "NA")) %>%
+    mutate(Delay  = fct_relevel(Delay, "0 minutes","Under 5 minutes","5-10 minutes", "10-20 minutes","20+ minutes", "NA"))
+
+palette_plasma_na = c("#0d0887", "#7e03a8", "#cc4778", "#f89540", "#f0f921", "#ffffff") #white at the end
+
+nj_animation <-
+  ggplot()+
+  geom_sf(data = nj_shape, fill = "gray", color = "gray40")+
+  geom_sf(data = nyc, fill = "gray", color = "gray40")+
+  geom_sf(data = nec_line, color = "white")+
+  geom_sf(data = nj_animation_data, aes(color = Delay), size = 3)+
+  scale_color_manual(values = palette_plasma_na)+
+  #scale_color_viridis(option = "plasma", discrete = TRUE)+
+  labs(title = "Median Delays by station for one Monday in November",
+       subtitle = "NJ Transit NE Corridor, 2019\n15 minute intervals: {current_frame}",
+       fill = "Median Delay")+
+  ylim(40.21, 40.8)+
+  xlim(-74.8, -73.99)+
+  transition_manual(interval15)+
+  theme_void()
+
+animate(nj_animation, duration = 20, renderer = gifski_renderer())
+
+# Run this to save the gif - but remember to change the filename to not save over the last one!
+#anim_save(filename = "delays.gif", animation = last_animation(), path = "C:/Users/jtrum/MUSA_508_Final/508Final_Adams_Rummler/presentation/")
+```
+
+#### Southbound delays
+We created a gif to show the delays in southbound trains over the course of a day.
+To make this gif, we first filtered our NEC dataset down to just one day and direction. Then, we created a panel include all 15 minute increments at each station. We joined our NEC data to this and aggregated the median delay per 15-minute interval for each station. We also created a categorical variable for the median delay so that viewers can more easily tell how late each train was. 
+
+```{r southbound gif, message = FALSE, warning = FALSE, fig.align="center"}
+sbound_nov18 <- filter(ne_corridor, yday(interval60) == 322 & direction == "SOUTHBOUND") %>% #Nov 18
+  mutate(interval15 = floor_date(ymd_hms(scheduled_time), unit = "15 mins")) %>%
+  dplyr::select(station, scheduled_time, delay_minutes, interval15, direction)
+
+sbound_nov18.panel <- expand.grid(interval15 = unique(sbound_nov18$interval15),
+                            station = unique(sbound_nov18$station))
+southbound_animation_data <- 
+  left_join(sbound_nov18.panel, sbound_nov18, by = c("interval15", "station")) %>%
+  group_by(interval15, station) %>%
+  summarize(MedDelay = median(delay_minutes, na.rm = T)) %>%
+  ungroup() %>%
+  left_join(nec_stations, by=c("station")) %>%
+  st_sf() %>%
+    mutate(Delay = case_when(MedDelay == 0 ~ "0 minutes",
+                             MedDelay > 0 & MedDelay <= 5 ~ "Under 5 minutes",
+                             MedDelay > 5 & MedDelay <= 10 ~ "5-10 minutes",
+                             MedDelay > 10 & MedDelay <= 20 ~ "10-20 minutes",
+                             MedDelay > 20 ~ "20+ minutes",
+                             is.na(MedDelay) ~ "NA")) %>%
+    mutate(Delay  = fct_relevel(Delay, "0 minutes","Under 5 minutes","5-10 minutes", "10-20 minutes","20+ minutes", "NA"))
+```
+
+Seeing the delays represented spatially and temporally in gif format offers a key insight into the space/time process of delays. Delays appear to cluster in time and space: trains are similarly delayed at nearby stations, and in order of sequence in the direction of travel. We have incorporated this into our model by finding the lag of delays at previous stations, letting us look "back" in time and space.
+
+```{r southbound gif display, cache = TRUE, message = FALSE, warning = FALSE}
+southbound_animation <-
+  ggplot()+
+  geom_sf(data = nj_shape, fill = "gray", color = "gray40")+
+  geom_sf(data = nyc, fill = "gray", color = "gray40")+
+  geom_sf(data = nec_line, color = "white")+
+  geom_sf(data = southbound_animation_data, aes(color = Delay), size = 3)+
+  scale_color_manual(values = palette_plasma_na)+
+  #scale_color_viridis(option = "plasma", discrete = TRUE)+
+  labs(title = "Median Delays by station for one Monday in November - Southbound",
+       subtitle = "NJ Transit NE Corridor, 2019\n15 minute intervals: {current_frame}",
+       fill = "Median Delay")+
+  ylim(40.21, 40.8)+
+  xlim(-74.8, -73.99)+
+  transition_manual(interval15)+
+  theme_void()
+
+animate(southbound_animation, duration = 20, renderer = gifski_renderer())
+```
+
+```{r save southbound gif, eval = FALSE, include=FALSE}
+# Run this to save the gif - but remember to change the filename to not save over the last one!
+#anim_save(filename = "southbound_delays.gif", animation = last_animation(), path = "images/")
+```
+
+#### Northbound delays
+We followed the same process to create a gif to illustrate northbound delays over the course of the same day.
+```{r northbound gif, message = FALSE, warning = FALSE, fig.align="center",}
+nbound_nov18 <- filter(ne_corridor, yday(interval60) == 322 & direction == "NORTHBOUND") %>% #Nov 18
+  mutate(interval15 = floor_date(ymd_hms(scheduled_time), unit = "15 mins")) %>%
+  dplyr::select(station, scheduled_time, delay_minutes, interval15, direction)
+
+nbound_nov18.panel <- expand.grid(interval15 = unique(nbound_nov18$interval15),
+                            station = unique(nbound_nov18$station))
+
+northbound_animation_data <- 
+  left_join(nbound_nov18.panel, nbound_nov18, by = c("interval15", "station")) %>%
+  group_by(interval15, station) %>%
+  summarize(MedDelay = median(delay_minutes, na.rm = T)) %>%
+  ungroup() %>%
+  left_join(nec_stations, by=c("station")) %>%
+  st_sf() %>%
+    mutate(Delay = case_when(MedDelay == 0 ~ "0 minutes",
+                             MedDelay > 0 & MedDelay <= 5 ~ "Under 5 minutes",
+                             MedDelay > 5 & MedDelay <= 10 ~ "5-10 minutes",
+                             MedDelay > 10 & MedDelay <= 20 ~ "10-20 minutes",
+                             MedDelay > 20 ~ "20+ minutes",
+                             is.na(MedDelay) ~ "NA")) %>%
+    mutate(Delay  = fct_relevel(Delay, "0 minutes","Under 5 minutes","5-10 minutes", "10-20 minutes","20+ minutes", "NA"))
+```
+
+```{r northbound animation plot and animate, cache = TRUE, message = FALSE, warning = FALSE}
+northbound_animation <-
+  ggplot()+
+  geom_sf(data = nj_shape, fill = "gray", color = "gray40")+
+  geom_sf(data = nyc, fill = "gray", color = "gray40")+
+  geom_sf(data = nec_line, color = "white")+
+  geom_sf(data = northbound_animation_data, aes(color = Delay), size = 3)+
+  scale_color_manual(values = palette_plasma_na)+
+  #scale_color_viridis(option = "plasma", discrete = TRUE)+
+  labs(title = "Median Delays by station for one Monday in November - Northbound",
+       subtitle = "NJ Transit NE Corridor, 2019\n15 minute intervals: {current_frame}",
+       fill = "Median Delay")+
+  ylim(40.21, 40.8)+
+  xlim(-74.8, -73.99)+
+  transition_manual(interval15)+
+  theme_void()
+
+animate(northbound_animation, duration = 20, renderer = gifski_renderer())
+```
+
+```{r save northbound gif, eval = FALSE, include = FALSE, message = FALSE, warning = FALSE}
+# Run this to save the gif - but remember to change the filename to not save over the last one!
+# anim_save(filename = "northbound_delays.gif", animation = last_animation(), path = "presentation/")
+```
+
+
+## Feature Engineering: Create NE Corridor line
+
+We used all of this data to engineer several new temporal features:
+
+* **Previous Stations' Delays:** Next, we set up several variables to capture the train's delay at previous stations. For example, what was the train's delay at its previous station? We answered this up to four previous stations.
+
+* **Holidays:** Next, we created several variables to indicate whether the day was a holiday (Thanksgiving or Christmas), was up to three days before or after a holiday, or if it was the friday before a holiday. 
+
+* **Station and Train Time Delays:** Next, we created several variables to represent the delay of the same train, at the same station, over time: 1 week ago, 6 days ago, and so on up to 1 day ago. This became critical for our model to predict with increasing accuracy over time.
+
+* **Previous Trains' Delays:** Next, we created several variables to provide the delay of the previous train at the same station, up to four previous trains ago. 
+
+
+```{r engineer time lags, cache=TRUE, message = FALSE, warning = FALSE}
+
+# Create time lags
+ne_corridor <- ne_corridor %>%  
+  mutate(
+    # Train's Delays at previous stations
+    # Delay of same train at previous station
+    lag_station_Delay = case_when(
+      stop_sequence > 1 & 
+        ((train_id == dplyr::lag(train_id,1))) & 
+        (stop_sequence == (dplyr::lag(stop_sequence,1) + 1)) ~ 
+          dplyr::lag(delay_minutes),
+    stop_sequence == 1 ~ 0,
+    TRUE ~ 0),
+    # Delay of same train at 2 stations ago
+    lag_2station_Delay = case_when(
+      stop_sequence > 1 & 
+        ((train_id == dplyr::lag(train_id,2))) & 
+        (stop_sequence == (dplyr::lag(stop_sequence,2) + 2)) ~ 
+          dplyr::lag(delay_minutes, 2),
+    stop_sequence == 1 ~ 0,
+    TRUE ~ 0),
+    # Delay of same train at 3 stations ago
+    lag_3station_Delay = case_when(
+      stop_sequence > 1 & 
+        ((train_id == dplyr::lag(train_id,3))) & 
+        (stop_sequence == (dplyr::lag(stop_sequence,3) + 3)) ~ 
+          dplyr::lag(delay_minutes, 3),
+    stop_sequence == 1 ~ 0,
+    TRUE ~ 0),
+    # Delay of same train at 4 stations ago
+    lag_4station_Delay = case_when(
+      stop_sequence > 1 & 
+        ((train_id == dplyr::lag(train_id,4))) & 
+        (stop_sequence == (dplyr::lag(stop_sequence,4) + 4)) ~ 
+          dplyr::lag(delay_minutes, 4),
+    stop_sequence == 1 ~ 0,
+    TRUE ~ 0),
+    
+    # Holiday days
+         holiday = ifelse(yday(interval60) %in% holiday_days,1,0),
+         day = yday(interval60),
+    # Holiday Lag
+         holidayLag = case_when(
+           day %in% (holiday_days + 1) ~ "PlusOneDay",
+           day %in% (holiday_days + 1) ~ "PlusTwoDays",
+           day %in% (holiday_days + 3) ~ "PlusThreeDays",
+           day %in% (holiday_days - 1) ~ "MinusOneDay",
+           day %in% (holiday_days - 2) ~ "MinusTwoDays",
+           day %in% (holiday_days - 3) ~ "MinusThreeDays"),
+         holidayLag = ifelse(is.na(holidayLag) == TRUE, 0, holidayLag),
+    # Friday before a Holiday
+    Fri_preHol = case_when( # Identify Fridays before a holiday
+      dotw == "Fri" & day %in% (holiday_days - 1) ~ "Fri_preHoliday",
+      dotw == "Fri" & day %in% (holiday_days - 2) ~ "Fri_preHoliday",
+      dotw == "Fri" & day %in% (holiday_days - 3) ~ "Fri_preHoliday",
+      dotw == "Fri" & day %in% (holiday_days - 4) ~ "Fri_preHoliday",
+      dotw == "Fri" & day %in% (holiday_days - 5) ~ "Fri_preHoliday",
+      dotw == "Fri" & day %in% (holiday_days - 6) ~ "Fri_preHoliday",
+      dotw == "Fri" & day %in% (holiday_days - 7) ~ "Fri_preHoliday",
+      TRUE ~ "Not_FriPreHol")) %>%
+  
+  arrange(train_id, station, dotw, week) %>%
+  # 1 week ago train delay lag (what was delay at same station for same train, 1 week ago)
+    mutate(weekLag = case_when( 
+      train_id == dplyr::lag(train_id,1) &
+        dotw == dplyr::lag(dotw,1) ~
+        dplyr::lag(delay_minutes),
+      TRUE ~ 0)) %>%
+  arrange(train_id, station, day) %>%
+  # Yesterday train delay lag (what was delay of same train at same station, yesterday)
+  mutate(dayLag = case_when( 
+    train_id == dplyr::lag(train_id,1) &
+      to == dplyr::lag(to,1) &
+      from == dplyr::lag(from,1) ~
+      dplyr::lag(delay_minutes),
+    TRUE ~ 0
+  ),
+  # 2 day train delay lag (what was delay of same train at same station, 2 days ago)
+  twoDayLag = case_when( 
+    train_id == dplyr::lag(train_id,2) &
+      to == dplyr::lag(to,2) &
+      from == dplyr::lag(to, 2) ~
+      dplyr::lag(delay_minutes, 2),
+    TRUE ~ 0
+  ),
+  # 3 day train delay lag (what was the delay of same train at same station, 3 days ago)
+  threeDayLag = case_when( 
+    train_id == dplyr::lag(train_id,3) &
+      to == dplyr::lag(to,3) &
+      from == dplyr::lag(to, 3) ~
+      dplyr::lag(delay_minutes, 3),
+    TRUE ~ 0
+  ),
+  # 4 day train delay lag (what was the delay of same train at same station, 4 days ago)
+  fourDayLag = case_when( 
+    train_id == dplyr::lag(train_id,4) &
+      to == dplyr::lag(to,4) &
+      from == dplyr::lag(to, 4) ~
+      dplyr::lag(delay_minutes, 4),
+    TRUE ~ 0
+  ),
+  # 5 day train delay lag (what was the delay of the same train at same station, 5 days ago)
+  fiveDayLag = case_when( 
+    train_id == dplyr::lag(train_id,5) &
+      to == dplyr::lag(to,5) &
+      from == dplyr::lag(to, 5) ~
+      dplyr::lag(delay_minutes, 5),
+    TRUE ~ 0
+  ),
+  # 6 day train delay lag (what was hte delay of the same train at same station, 6 days ago)
+  sixDayLag = case_when( 
+    train_id == dplyr::lag(train_id,6) &
+      to == dplyr::lag(to,6) &
+      from == dplyr::lag(to, 6) ~
+      dplyr::lag(delay_minutes, 6),
+    TRUE ~ 0
+  )) %>%
+  arrange(to, from, interval60) %>%
+  # Previous train delay lag (what was the delay of the last [different] train at the same station?)
+  mutate(prevTrainDelay = case_when(
+    to == dplyr::lag(to, 1) & 
+      from == dplyr::lag(from, 1) ~ 
+      dplyr::lag(delay_minutes),
+    TRUE ~ 0),
+    # Previous 2 train delay lag (what was the delay of the second to last [different] train [2 trains ago] at the same station?)
+  prev2TrainDelay = case_when(
+    to == dplyr::lag(to, 2) & 
+      from == dplyr::lag(from, 2) ~ 
+      dplyr::lag(delay_minutes),
+    TRUE ~ 0),
+    # Previous 3 train delay lag (what was the delay of the third to last [different] train [3 trains ago] at the same station?)
+  prev3TrainDelay = case_when(
+    to == dplyr::lag(to, 3) & 
+      from == dplyr::lag(from, 3) ~ 
+      dplyr::lag(delay_minutes),
+    TRUE ~ 0),
+    # Previous 4 train delay lag (what was the delay of the fourth to last [different] train [4 trains ago] at the same station?)
+  prev4TrainDelay = case_when(
+    to == dplyr::lag(to, 4) & 
+      from == dplyr::lag(from, 4) ~ 
+      dplyr::lag(delay_minutes),
+    TRUE ~ 0))
+```
+
+```{r check, eval = FALSE, include = FALSE, message = FALSE, warning = FALSE}
+
+check <- (head(ne_corridor, 2000)) #%>%
+  #dplyr::select(to, from, train_id, scheduled_time, stop_sequence, direction, station_lat, adj_station_lat, delay_minutes)
+#, dayLag, weekLag, lag_station_Delay, day, holiday, holidayLag, Fri_preHol) #%>%
+ # mutate(SystemDelays_alltime = cummean(delay_minutes),
+         #DaysAvgDelays = #cummean((ifelse(day == dplyr::lag(day,1), delay_minutes, 0)))
+         # cummean(dplyr::lag(delay_minutes, :hour == hour-1)))
+         #DaysAvgSoFar = tapply(delay_minutes, day, cummean))
+
+view(check)
+
+```
+
+## Model
+
+Now we move to modelling. We began by dividing our NEC dataset into a training and test set. The training set is made up of five weeks in November and early December 2019, including Thanksgiving. The test set is made up of three weeks in December, including Christmas.
+
+```{r test and train}
+nec.Train <- dplyr::filter(ne_corridor, week >= 45 & week < 49) #train on 5 weeks, including Thanksgiving
+nec.Test <- dplyr::filter(ne_corridor, week > 49 & week < 53) #test on 3 weeks, including christmas
+```
+
+### Linear Regressions
+We built 10 linear models. For each, the delay, in minutes, was the dependent variable.
+
+Our first model was our baseline model, and included the station's fixed effects; the station's stop sequence for that train; the hour of scheduled arrival; the day of the week; the train's direction of travel; three measures of the weather (temperature, precipitation, and wind speed); and three variables relating to the holidays: whether the day was a holiday, the holiday lag, and whether it was a Friday before a holiday.
+
+Our next models were built on the baseline model, but added increasingly shorter timelines to it: starting with the delay from a week ago; to the delay six days ago; and so on, until the closest amount of time: the train's delay at the previous station.
+
+
+```{r models,  cache=TRUE, message=FALSE, warning = FALSE }
+# Baseline - no time lags aside from holidays
+baseline_reg <- 
+    lm(delay_minutes ~  station + stop_sequence + hour(interval60) + dotw + Temperature + Precipitation + Wind_Speed + holiday + holidayLag + Fri_preHol + direction, 
+     data=nec.Train)
+
+# 1 week ahead
+aheadWeek_reg <-
+   lm(delay_minutes ~  station + stop_sequence + hour(interval60) + dotw + Temperature + Precipitation + Wind_Speed + holiday + holidayLag + Fri_preHol + direction + weekLag,
+      data = nec.Train)
+
+# 5 days ahead
+ahead5days_reg <- lm(delay_minutes ~  station + stop_sequence + hour(interval60) + dotw + Temperature + Precipitation + Wind_Speed + holiday + holidayLag + Fri_preHol + direction + weekLag + sixDayLag + fiveDayLag,
+      data = nec.Train)
+
+# 3 days ahead
+ahead3days_reg <- lm(delay_minutes ~  station + stop_sequence + hour(interval60) + dotw + Temperature + Precipitation + Wind_Speed + holiday + holidayLag + Fri_preHol + direction + weekLag + sixDayLag + fiveDayLag + fourDayLag + threeDayLag,
+      data = nec.Train)
+
+# 1 day ahead
+ahead1day_reg <- lm(delay_minutes ~  station + stop_sequence + hour(interval60) + dotw + Temperature + Precipitation + Wind_Speed + holiday + holidayLag + Fri_preHol + direction + weekLag + sixDayLag + fiveDayLag + fourDayLag + threeDayLag + twoDayLag + dayLag,
+      data = nec.Train)
+
+# 1 train ahead (roughly 30 mins - 1 hr ahead)
+prevTrain_reg <- lm(delay_minutes ~  station + stop_sequence + hour(interval60) + dotw + Temperature + Precipitation + Wind_Speed + holiday + holidayLag + Fri_preHol + direction + weekLag + sixDayLag + fiveDayLag + fourDayLag + threeDayLag + twoDayLag + dayLag + prev4TrainDelay + prev3TrainDelay + prev2TrainDelay + prevTrainDelay,
+      data = nec.Train)
+
+# 4 stations ahead
+prev4Stn_reg <- lm(delay_minutes ~  station + stop_sequence + hour(interval60) + dotw + Temperature + Precipitation + Wind_Speed + holiday + holidayLag + Fri_preHol + direction + weekLag + sixDayLag + fiveDayLag + fourDayLag + threeDayLag + twoDayLag + dayLag + prevTrainDelay + lag_4station_Delay,
+      data = nec.Train)
+
+# 3 stations ahead
+prev3Stn_reg <- lm(delay_minutes ~  station + stop_sequence + hour(interval60) + dotw + Temperature + Precipitation + Wind_Speed + holiday + holidayLag + Fri_preHol + direction + weekLag + sixDayLag + fiveDayLag + fourDayLag + threeDayLag + twoDayLag + dayLag + prevTrainDelay + lag_4station_Delay + lag_3station_Delay,
+      data = nec.Train)
+
+# 2 stations ahead
+prev2Stn_reg <- lm(delay_minutes ~  station + stop_sequence + hour(interval60) + dotw + Temperature + Precipitation + Wind_Speed + holiday + holidayLag + Fri_preHol + direction + weekLag + sixDayLag + fiveDayLag + fourDayLag + threeDayLag + twoDayLag + dayLag + prevTrainDelay + lag_4station_Delay + lag_3station_Delay + lag_2station_Delay,
+      data = nec.Train)
+
+# 1 station ahead (roughly 20-5 mins ahead)
+prevStn_reg <- lm(delay_minutes ~  station + stop_sequence + hour(interval60) + dotw + Temperature + Precipitation + Wind_Speed + holiday + holidayLag + Fri_preHol + direction + weekLag + sixDayLag + fiveDayLag + fourDayLag + threeDayLag + twoDayLag + dayLag + prevTrainDelay + lag_4station_Delay + lag_3station_Delay + lag_2station_Delay + lag_station_Delay,
+      data = nec.Train)
+```
+
+Next, we nested our data frame and created a function to map these regressions over our entire dataset in a fast and efficient way.
+
+```{r nest_data, warning = FALSE, message = FALSE}
+nec.Test.weekNest <- nec.Test %>%
+  nest(-week) 
+```
+
+```{r predict_function, message=FALSE, warning = FALSE }
+model_pred <- function(ne_corridor, fit){
+   pred <- predict(fit, newdata = ne_corridor)}
+```
+
+### Predict
+Next, we used our function to predict delays using each regression.
+
+```{r do_predicitons, results=FALSE, cache=TRUE, message=FALSE, warning = FALSE }
+week_predictions <- 
+  nec.Test.weekNest %>% 
+    mutate(aBaseline = map(.x = data, fit = baseline_reg, .f = model_pred),
+            bWeekAhead = map(.x = data, fit = aheadWeek_reg, .f = model_pred),
+           
+           cFiveDays = map(.x = data, fit = ahead5days_reg, .f = model_pred),
+           
+            dThreeDays = map(.x = data, fit = ahead3days_reg, .f = model_pred),
+            eOneDay = map(.x = data, fit = ahead1day_reg, .f = model_pred),
+           fPrevTrain = map(.x = data, fit = prevTrain_reg, .f = model_pred),
+           jPrevStation = map(.x = data, fit = prevStn_reg, .f = model_pred),
+            iPrev2Station = map(.x = data, fit = prev2Stn_reg, .f = model_pred),
+            hPrev3Station = map(.x = data, fit = prev3Stn_reg, .f = model_pred),
+            gPrev4Station = map(.x = data, fit = prev4Stn_reg, .f = model_pred)) %>% 
+    gather(Regression, Prediction, -data, -week) %>%
+    mutate(Observed = map(data, pull, delay_minutes),
+           Absolute_Error = map2(Observed, Prediction,  ~ abs(.x - .y)),
+           MAE = map_dbl(Absolute_Error, mean, na.rm = TRUE),
+           sd_AE = map_dbl(Absolute_Error, sd, na.rm = TRUE))
+
+```
+
+### Compare linear models
+The resulting Mean Absolute Errors (MAE) for each of our 10 models are plotted below for comparison. As we might expect, our models become more accurate the closer in time we are to the time, train, and station of interest. Our overall error, however, is quite acceptable: a maximum MAE of about 3.5 minutes for our baseline model in week 51 means that our predictions more than a week out are still useful. Our smallest MAE is for our shortest time prediction - the time between the train's previous station stop and the stop in question - with a MAE of just under 1.5 minutes.
+
+```{r plot_errors_by_model,  cache=TRUE, message=FALSE, warning = FALSE, fig.align="center", fig.height=7, fig.width=10 }
+mae10 <- week_predictions %>%
+  dplyr::select(week, Regression, MAE) %>%
+  gather(Variable, MAE, -Regression, -week) %>%
+  ggplot(aes(week, MAE)) + 
+    geom_bar(aes(fill = Regression), position = "dodge", stat="identity") +
+    #scale_fill_manual(values = palette5) +
+  scale_fill_viridis(option = "plasma", discrete = TRUE)+
+    labs(title = "Mean Absolute Errors by model specification and week") +
+  theme_bw()
+
+mae10
+```
+
+```{r mae plot save, eval = FALSE, include = FALSE}
+# ggsave("mae_10model.png", plot=mae10, path="C:/Users/jtrum/508Final_Adams_Rummler/presentation/")
+```
+
+The difference between our predicted and observed delays are plotted below for the three weeks of our test set. As we can see, our prediction improves in accuracy the closer in time we are to the event of the delay.
+
+```{r error_vs_actual_timeseries ,  cache=TRUE, warning = FALSE, message = FALSE, fig.align="center", fig.height=10, fig.width=10}
+
+pred_v_obs <- week_predictions %>% 
+    mutate(interval60 = map(data, pull, interval60),
+           station = map(data, pull, station)) %>%
+    dplyr::select(interval60, station, Observed, Prediction, Regression) %>%
+    unnest() %>%
+    gather(Variable, Value, -Regression, -interval60, -station) %>%
+    group_by(Regression, Variable, interval60) %>%
+    summarize(Value = sum(Value)) %>%
+    ggplot(aes(interval60, Value, colour=Variable)) + 
+  scale_color_manual(values = c("#cc4778", "#0d0887"))+
+      geom_line(size = 1.1) + 
+      facet_wrap(~Regression, ncol=1) +
+      labs(title = "Predicted/Observed delays in minutes time series", subtitle = "A test set of 3 weeks",  x = "Time", y= "Delays in Minutes") +
+      theme_bw()
+
+pred_v_obs
+```
+
+```{r save error vs actual timeseries, eval = FALSE, include = FALSE}
+# ggsave("pred_v_obs.png", plot=pred_v_obs, path="C:/Users/jtrum/508Final_Adams_Rummler/presentation/")
+```
+
+## Evaluating Errors
+Our model of four prior stations' delay is plotted below by time of day and day of the week. Our model appears to generalize across time fairly well, with the least errors in prediction in the overnight and evening rush hours for the weekend; and the largest errors in prediction in weekdays' overnight and evening rush hours.
+
+```{r obs_pred_all, warning=FALSE, message = FALSE, fig.align="center", fig.height=7, fig.width=10}
+gPrev4Station_pred <- week_predictions %>% 
+    mutate(interval60 = map(data, pull, interval60),
+           station = map(data, pull, station), 
+           dotw = map(data, pull, dotw)) %>%
+    select(interval60, station, Observed, Prediction, Regression,
+           dotw) %>%
+    unnest() %>%
+  filter(Regression == "gPrev4Station")%>%
+  mutate(weekend = ifelse(dotw %in% c("Sun", "Sat"), "Weekend", "Weekday"),
+         time_of_day = case_when(hour(interval60) < 7 | hour(interval60) > 18 ~ "Overnight",
+                                 hour(interval60) >= 7 & hour(interval60) < 10 ~ "AM Rush",
+                                 hour(interval60) >= 10 & hour(interval60) < 15 ~ "Mid-Day",
+                                 hour(interval60) >= 15 & hour(interval60) <= 18 ~ "PM Rush"))%>%
+  ggplot()+
+  geom_point(aes(x= Observed, y = Prediction), color = "gray")+
+    geom_smooth(aes(x= Observed, y= Prediction), method = "lm", se = FALSE, color = "#cc4778")+
+    geom_abline(slope = 1, intercept = 0, color = "#0d0887")+
+  facet_grid(time_of_day~weekend)+
+  labs(title="Observed vs Predicted Delays in Minutes",
+       subtitle="Regression G - Four Previous Stations",
+       x="Observed delays", 
+       y="Predicted delays")+
+  theme_bw()
+
+gPrev4Station_pred
+```
+
+```{r save obs_pred_All, eval = FALSE, include=FALSE}
+# ggsave("gPrev4Station_pred.png", plot=gPrev4Station_pred, path="C:/Users/jtrum/508Final_Adams_Rummler/presentation/")
+```
+
+```{r obs_pred_all2, include = FALSE, eval = FALSE, warning=FALSE, message = FALSE}
+jPrevStation_pred <- week_predictions %>% 
+    mutate(interval60 = map(data, pull, interval60),
+           station = map(data, pull, station), 
+           dotw = map(data, pull, dotw)) %>%
+    select(interval60, station, Observed, Prediction, Regression,
+           dotw) %>%
+    unnest() %>%
+  filter(Regression == "jPrevStation")%>%
+  mutate(weekend = ifelse(dotw %in% c("Sun", "Sat"), "Weekend", "Weekday"),
+         time_of_day = case_when(hour(interval60) < 7 | hour(interval60) > 18 ~ "Overnight",
+                                 hour(interval60) >= 7 & hour(interval60) < 10 ~ "AM Rush",
+                                 hour(interval60) >= 10 & hour(interval60) < 15 ~ "Mid-Day",
+                                 hour(interval60) >= 15 & hour(interval60) <= 18 ~ "PM Rush"))%>%
+  ggplot()+
+  geom_point(aes(x= Observed, y = Prediction), color = "gray")+
+    geom_smooth(aes(x= Observed, y= Prediction), method = "lm", se = FALSE, color = "#cc4778")+
+    geom_abline(slope = 1, intercept = 0, color = "#0d0887")+
+  facet_grid(time_of_day~weekend)+
+  labs(title="Observed vs Predicted Delays in Minutes",
+       subtitle="Regression J - Previous Station",
+       x="Observed delays", 
+       y="Predicted delays")+
+  theme_bw()
+
+jPrevStation_pred
+```
+
+```{r save plot, eval = FALSE, include=FALSE}
+# ggsave("jPrevStation_pred.png", plot=jPrevStation_pred, path="C:/Users/jtrum/508Final_Adams_Rummler/presentation/")
+```
+
+
+Mapping our MAE by station reveals that while most stations have relatively small MAE, our largest MAE is concentrated in stations at the start and end of the line. The starting stations are the hardest to predict for, since they don't have the benefit of the previous station's lag to inform their prediction. NYP in particular has the largest prediction MAE, suggesting that there may be more at play in delays at this station than the station's fixed effects, weather, and holiday lags can explain. 
+
+```{r errors by station, warning=FALSE, message = FALSE, fig.align="center"}
+mae_station2 <- week_predictions %>% 
+    mutate(interval60 = map(data, pull, interval60),
+           station = map(data, pull, station),
+           geometry = map(data, pull, geometry)) %>%
+    select(interval60, station, Observed, Prediction, Regression) %>%
+    unnest() %>%
+  filter(Regression == "jPrevStation") %>%
+  group_by(station) %>%
+  left_join(., nec_stations, by = "station") %>%
+  st_as_sf(crs = 4326) %>%
+  summarize(MAE = mean(abs(Observed-Prediction), na.rm = TRUE))%>%
+ggplot(.)+
+  geom_sf(data = nj_shape, fill = "gray", color = "gray40")+
+  geom_sf(data = nyc, fill = "gray", color = "gray40")+
+  geom_sf(data = nec_line, color = "white")+
+  geom_sf(aes(color = MAE), fill = "transparent", size = 3)+
+  scale_colour_viridis(#direction = -1,
+  discrete = FALSE, option = "plasma")+
+  ylim(40.21, 40.8)+
+  xlim(-74.8, -73.99)+
+  labs(title="Mean Absolute Error",
+       subtitle = "Regression J - 1 Station Ahead")+
+  theme_void()
+
+mae_station2 
+```
+
+```{r save mae station, eval = FALSE, include = FALSE}
+# ggsave("maestation2.png", plot=mae_station2, path="C:/Users/jtrum/508Final_Adams_Rummler/presentation/")
+
+```
+
+## Cross-Validation
+
+We ran a Leave One Group Out (LOGO) cross-validation on our dataset, dividing the dataset into iterative test folds by station (16 folds total).
+
+First, we defined a function to perform this cross-validation.
+```{r cv function, warning=FALSE, message = FALSE}
+crossValidate <- function(dataset, id, dependentVariable, indVariables){ #factor_var) {
+  
+  allPredictions <- data.frame()
+  cvID_list <- unique(dataset[[id]])
+  
+  for (i in cvID_list) {
+    
+    thisFold <- i
+    cat("This hold out fold is", thisFold, "\n")
+    
+    fold.train <- filter(dataset, dataset[[id]] != thisFold) %>% as.data.frame() %>% 
+      dplyr::select(id, #geometry, 
+                    all_of(indVariables),
+                    all_of(dependentVariable))
+    
+    fold.test  <- filter(dataset, dataset[[id]] == thisFold) %>% as.data.frame() %>% 
+      dplyr::select(id, #geometry, 
+                    all_of(indVariables),
+                    all_of(dependentVariable))
+    #MDH added
+      #fold.test[,factor_var] <- factor(fold.test[,factor_var], levels = dataset[,factor_var])
+
+    form_parts <- paste0(dependentVariable, " ~ ", paste0(indVariables, collapse = "+"))
+    form <- as.formula(form_parts)
+    regression <- lm(form,
+                      data = fold.train %>%
+                        dplyr::select(#-geometry, 
+                          -all_of(id)))
+    
+    thisPrediction <-
+      mutate(fold.test, Prediction = predict(regression, fold.test, type = "response"))
+    
+    allPredictions <-
+      rbind(allPredictions, thisPrediction)
+    
+  }
+  return(#st_sf(
+    allPredictions)#)
+}
+```
+
+Then we used our function to run a LOGO-CV based on our 1-day lag model, and aggregated the results by station.
+
+```{r delays cv, warning=FALSE, message = FALSE, results = FALSE}
+delays.CV <- crossValidate(
+  dataset = ne_corridor, 
+  id = "station",
+  dependentVariable = "delay_minutes",
+  indVariables = c(#"station", 
+                   "hour", "dotw","Temperature", "Precipitation", "Wind_Speed", "holiday", "holidayLag", "Fri_preHol", "weekLag", "sixDayLag", "fiveDayLag", "fourDayLag", "threeDayLag", "twoDayLag", "dayLag")) %>%
+  dplyr::select(cvID = station, delay_minutes, Prediction)
+
+```
+
+```{r calculate CV MAE, message=FALSE, warning = FALSE, results = FALSE}
+
+error_by_reg_and_fold <- 
+  delays.CV %>%
+    group_by(cvID) %>% 
+    summarize(Mean_Error = mean(Prediction - delay_minutes, na.rm = T),
+              MAE = mean(abs(Mean_Error), na.rm = T),
+              SD_MAE = mean(abs(Mean_Error), na.rm = T)) %>%
+  ungroup()
+
+error_by_reg_and_fold %>% 
+  arrange(desc(MAE))
+error_by_reg_and_fold %>% 
+  arrange(MAE)
+```
+
+```{r cv mae kable, EVAL = FALSE, include = FALSE, message=FALSE, warning = FALSE}
+kable(error_by_reg_and_fold) %>%
+  kable_material_dark()
+```
+
+Below is the distribution of our of fold errors for our LOGO-CV by station. Our mean MAE for all folds is 0.436 minutes, or about 26 seconds - indicating that our model is highly accurate.
+
+```{r MAE histogram plot, cache = TRUE, message=FALSE, warning = FALSE, fig.align="center"}
+mae_by_track <- error_by_reg_and_fold %>%
+  ggplot(aes(MAE)) + 
+    geom_histogram(bins = 30, colour="black", fill = "#cc4778") +
+  scale_x_continuous(breaks = seq(0, 11, by = 0.1)) + 
+  geom_vline(xintercept = mean(error_by_reg_and_fold$MAE), linetype = "dashed", color = "#0d0887", size = 1)+
+    labs(title="Distribution of MAE by Station", subtitle = "LOGO-CV, mean MAE indicated with dashed line",
+         x="Mean Absolute Error", y="Count")+
+  #annotate(x = mean(error_by_reg_and_fold$MAE)-0.03, y = 48, label = "Mean MAE", vjust = 0.5, geom = "label")+
+  theme_bw()
+
+mae_by_track
+```
+
+```{r save mae hist, eval = FALSE, include=FALSE}
+# ggsave("mae_by_track.png", plot=mae_by_track, path="C:/Users/jtrum/MUSA_508_Final/508Final_Adams_Rummler/presentation/")
+```
+
+Our LOGO-CV MAE are mapped below by station. Similar to our previous errors-by-station map, the beginning and ending stations of our line see the highest errors, although in this iteration, Trenton sees the highest MAE, at just over 1.25 minutes. This means that our model generalizes well across space.
+
+```{r map LOGO CV MAE errors, message=FALSE, warning = FALSE, fig.align="center"}
+error_geoms <- error_by_reg_and_fold %>% 
+  left_join(., nec_stations, by = c("cvID" = "station")) %>%
+  st_as_sf()%>%
+  st_transform("EPSG:4326")
+
+logo_cv_map <- ggplot()+
+  geom_sf(data = nj_shape, fill = "gray", color = "gray40")+
+  geom_sf(data = nyc, fill = "gray", color = "gray40")+
+  geom_sf(data = nec_line, color = "white")+
+  geom_sf(data = error_geoms, aes(color = MAE), size = 3)+
+  scale_color_viridis(option = "plasma", name="MAE") +
+  labs(title="LOGO-CV Mean Absolute Error (MAE) by Station",
+       subtitle = "NJ Transit, NE Corridor") +
+  ylim(40.21, 40.8)+
+  xlim(-74.8, -73.99)+
+  theme_void()
+
+logo_cv_map
+```
+
+```{r save logo cv map, include = FALSE, eval=FALSE}
+ # ggsave("logo_cv_map.png", plot=logo_cv_map, path="presentation/")
+```
+
+## Conclusion
+Our analysis allows for an increasingly accurate prediction of NEC train delays. Commuters could use this to get a highly accurate idea of how delayed their train will be, up to a week ahead of time. Our model is useful - it is highly accurate, and it generalizes well across different stations. Therefore, it could be used reliably by commuters to anticipate their train's delay at a particular station when and where they need it.
+
+While our analysis resulted in a highly accurate model, it doesn’t explain all of the variance in train delays. (At its most accurate, it explains about 80% of why a train is delayed). It is likely that the delays and interaction of the NEC with Amtrak and other NJ Transit trains impact the NEC’s delays. Therefore, a future analysis should consider expanding out our analysis to other NJ Transit lines and Amtrak to more cohesively understand how the entire system works (or doesn’t work) together. Our analysis was intentionally narrow, in order to build a prototype. Future models should add complexity in order to build an increasingly accurate and insightful tool.
+
+## Bonus: Logistic Regression
+Our proposed model uses a linear regression to predict the number of minutes that a train will be delayed. However, we wanted to present an alternative method to predict train delays by using a logistic regression. Using a logisitc regression, we can predict whether a train will be more than a certain number of minutes late, and provide a probability that this will be true. 
+
+Our original linear model is useful several hours in advance so users can gauge exact time delays, whereas this model may be more useful several days in advance to obtain a general idea of potential delay.
+
+To build this logistic model, we first created a new binary variable in our NEC data set to tell us if the delay is greater than 3 minutes.
+
+```{r log var, message=FALSE, warning = FALSE}
+# Delay numeric - for binary log regression model
+ne_corridor_log <- st_drop_geometry(ne_corridor) %>%
+  mutate(delay_numeric = ifelse(#prev4TrainDelay # why not actual delay?
+    delay_minutes > 3 , 1, 0)) 
+```
+
+Next, we created new train and test sets that incorporate this binary variable.
+```{r train and test no geoms, message=FALSE, warning = FALSE}
+nec.Train_nogeom <- dplyr::filter(ne_corridor_log, week >= 45 & week < 49) #train on 5 weeks, including Thanksgiving
+
+
+nec.Test_nogeom <- dplyr::filter(ne_corridor_log, week > 49 & week < 53) #test on 3 weeks, including christmas
+
+```
+
+Next, we created a logistic regression that predicted whether the train's delay will be greater than three minutes, based on information up to four stations away.
+
+```{r log reg, message=FALSE, warning = FALSE}
+nec.Train_log <- glm(delay_numeric ~ .,
+                   data=nec.Train_nogeom %>% 
+                     dplyr::select(
+                       #-to,
+                     #               -from,
+                     #               -scheduled_time,
+                     #               -delay_minutes,
+                     #               -status,
+                     #               -hour,
+                     #               -week,
+                     #               -station_lat,
+                     #               -adj_station_lat,
+                     #               -lag_station_Delay,
+                     #               -lag_2station_Delay,
+                     #               -lag_3station_Delay,
+                     #               -lag_4station_Delay,
+                     #               -prevTrainDelay,
+                     #               -prev2TrainDelay,
+                     #               -prev3TrainDelay,
+                     #               -prev4TrainDelay,
+                     #               -train_id,
+                     #               -dotw
+                                   # -day
+                                   # -dayLag,
+                                   # -weekLag,
+                                   # -twoDayLag,
+                                   # -threeDayLag,
+                                   # -fourDayLag,
+                                   # -fiveDayLag,
+                                   # -sixDayLag
+                                   station,
+                                   stop_sequence,
+                                   hour,
+                                   dotw,
+                                   Temperature,
+                                   Precipitation,
+                                   Wind_Speed,
+                                   holiday,
+                                   holidayLag,
+                                   Fri_preHol,
+                                   direction,
+                                   weekLag,
+                                   sixDayLag,
+                                   fiveDayLag,
+                                   fourDayLag,
+                                   threeDayLag,
+                                   twoDayLag,
+                                   dayLag,
+                                   prevTrainDelay,
+                                   lag_4station_Delay,
+                                   delay_numeric
+                                   ),
+family="binomial" (link="logit"))
+
+```
+
+We use this regression to predict the delay of our test set's trains.
+```{r log prediction, message=FALSE, warning = FALSE}
+
+testProbs <- data.frame(Outcome = as.factor(nec.Test_nogeom$delay_numeric), 
+                        Probs = predict(nec.Train_log, nec.Test_nogeom, type= "response"))
+```
+
+Next, we plot a density of predicted probabilities.
+```{r density plot, message=FALSE, warning = FALSE}
+density <- ggplot(testProbs, aes(x = Probs, fill = as.factor(Outcome))) + 
+  geom_density() +
+  facet_grid(Outcome ~ .) +
+  scale_fill_manual(values = c("#f0f921", "#0d0887")) + xlim(0, 1) +
+  labs(x = "Probabilities",
+       title = "Density of predicted probabilities") +
+  theme_bw()+
+  theme(strip.text.x = element_text(size = 18),
+        legend.position = "none")
+
+density
+```
+
+```{r save density plot, eval=FALSE, include=FALSE}
+# ggsave("density.png", plot=density, path="C:/Users/jtrum/508Final_Adams_Rummler/presentation/")
+```
+
+The results of our ROC curve are below.
+```{r roc, message=FALSE, warning = FALSE}
+
+roc <- ggplot(testProbs, aes(d = as.numeric(testProbs$Outcome), m = Probs)) +
+  geom_roc(n.cuts = 50, labels = FALSE, colour = "#cc4778") +
+  style_roc(theme = theme_grey) +
+  geom_abline(slope = 1, intercept = 0, size = 1.5, color = 'black') +
+  labs(title = "ROC Curve - 4 Station Lag")+
+  theme_bw()
+
+roc
+```
+
+```{r save roc, eval=FALSE, include=FALSE}
+# ggsave("roc.png", plot=roc, path="C:/Users/jtrum/508Final_Adams_Rummler/presentation/")
+```
+
+Our AUC is 0.81, as calculated below. This means we have model that correctly predicts true delays and minimizes incorrect predictions.
+```{r auc, message=FALSE, warning = FALSE, results = FALSE}
+pROC::auc(testProbs$Outcome, testProbs$Probs)
+```
+
+And finally, we can prepare a confusion matrix of our results. With a sensitivity of 0.7 and a specificity of 0.78, our model does a good job of predicting whether or not a train will be more than 3 minutes late.
+
+```{r confusion matrix, message=FALSE, warning = FALSE, results = FALSE}
+testProbs <- testProbs %>%
+  mutate(predOutcome= as.factor(ifelse(testProbs$Probs > 0.5 , 1, 0)))
+
+
+caret::confusionMatrix(testProbs$predOutcome,testProbs$Outcome, 
+                       positive = "1")
+```
+
+We cross-validate our model.
+
+```{r cross_val_binary, cache = TRUE, message = FALSE, warning=FALSE, results = FALSE}
+ne_corridor_log <- na.omit(ne_corridor_log) %>%
+  mutate(delay_nonnumeric = ifelse(delay_numeric == 0, "No", "Yes"))
+
+ctrl <- trainControl(method = "cv", 
+                     number = 100, 
+                     classProbs=TRUE, 
+                     verbose=FALSE, 
+                     summaryFunction=twoClassSummary)
+
+cvFit <- train(delay_nonnumeric~ ., 
+               data = ne_corridor_log %>% dplyr::select(
+                                   # -to,
+                                   # -from,
+                                   # -scheduled_time,
+                                   # -delay_minutes,
+                                   # delay_numeric,
+                                   # -status,
+                                   # -hour,
+                                   # -week,
+                                   # -station_lat,
+                                   # -adj_station_lat,
+                                   # -lag_station_Delay,
+                                   # -lag_2station_Delay,
+                                   # -lag_3station_Delay,
+                                   # -lag_4station_Delay,
+                                   # -prevTrainDelay,
+                                   # -prev2TrainDelay,
+                                   # -prev3TrainDelay,
+                                   # -prev4TrainDelay,
+                                   # -train_id,
+                                   # -dotw,
+                                   station,
+                                   stop_sequence,
+                                   hour,
+                                   dotw,
+                                   Temperature,
+                                   Precipitation,
+                                   Wind_Speed,
+                                   holiday,
+                                   holidayLag,
+                                   Fri_preHol,
+                                   direction,
+                                   weekLag,
+                                   sixDayLag,
+                                   fiveDayLag,
+                                   fourDayLag,
+                                   threeDayLag,
+                                   twoDayLag,
+                                   dayLag,
+                                   prevTrainDelay,
+                                   lag_4station_Delay,
+                                   delay_nonnumeric), 
+                method="glm", family="binomial",
+                metric="ROC", trControl = ctrl)
+
+cvFit
+```
+
+The plot below presents the results of our cross-validation. Our model sees a high ROC of 0.82, a Sensitivity of 0.8, and Specificity of 0.69.
+
+```{r cv log plot, message=FALSE, warning=FALSE}
+cross_val_Binary <- dplyr::select(cvFit$resample, -Resample) %>%
+  gather(metric, value) %>%
+  left_join(gather(cvFit$results[2:4], metric, mean)) %>%
+  ggplot(aes(value)) + 
+  geom_histogram(bins=35, fill = "#cc4778") +
+  facet_wrap(~metric) +
+  geom_vline(aes(xintercept = mean), colour = "black", linetype = 3, size = 1.5) +
+  scale_x_continuous(limits = c(0, 1)) +
+  labs(x="%", y="Count", title="Cross-Validation: Binary Model")+
+  theme_bw()
+
+cross_val_Binary
+
+```
