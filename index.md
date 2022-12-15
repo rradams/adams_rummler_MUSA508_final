@@ -2,9 +2,9 @@
 
 ---
 
-### Category Name 1 
+### [Final Project](/NEC_line_knit.html)
 
-[Final Project](/NEC_line_knit)
+[Final Project](/NEC_line_knit.html)
 <img src="images/dummy_thumbnail.jpg?raw=true"/>
 
 ---
