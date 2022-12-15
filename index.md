@@ -1,10 +1,10 @@
-## Portfolio
+## The Flex Commuter
 
 ---
 
 ### Category Name 1 
 
-[Project 1 Title](/sample_page)
+[Final Project](/NEC_line_knit)
 <img src="images/dummy_thumbnail.jpg?raw=true"/>
 
 ---
